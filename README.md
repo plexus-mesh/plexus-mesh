@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/Language-Rust-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License">
   <img src="https://img.shields.io/badge/Status-Architecting-green.svg" alt="Status">
-  <a href="[https://twitter.com/DEIN_HANDLE](https://x.com/plexusmesh?s=21)"><img src="https://img.shields.io/twitter/follow/DEIN_HANDLE?style=social" alt="Twitter Follow"></a>
+  <a href="[https://twitter.com/DEIN_HANDLE](https://x.com/plexusmesh?s=21)"><img src="[https://img.shields.io/twitter/follow/DEIN_HANDLE?style=social](https://x.com/plexusmesh?s=21)" alt="Twitter Follow"></a>
 </p>
 
 ---
