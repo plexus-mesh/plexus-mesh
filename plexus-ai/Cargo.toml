@@ -24,6 +24,10 @@ qdrant-client = "1.16.0"
 uuid = { version = "1.20.0", features = ["v4", "fast-rng"] }
 sha2 = "0.10"
 hex = "0.4"
+lancedb = "0.23.1"
+arrow-array = "56.2.0"
+arrow-schema = "56.2.0"
+futures.workspace = true
 
 [features]
 default = []

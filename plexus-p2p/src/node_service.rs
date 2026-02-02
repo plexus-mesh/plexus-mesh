@@ -15,8 +15,8 @@ use libp2p::{
     Swarm,
 };
 use plexus_ai::{
-    voice::WhisperEngine, BertEmbedder, ChatHistory, LLMEngine, QdrantStore, SimpleVectorStore,
-    TinyLlamaEngine, VectorStore,
+    voice::WhisperEngine, BertEmbedder, ChatHistory, LLMEngine, LanceDbStore, QdrantStore,
+    SimpleVectorStore, TinyLlamaEngine, VectorStore,
 };
 use std::collections::HashMap; // Use HashMap instead of CRDTs
 use std::path::PathBuf;
@@ -170,6 +170,16 @@ impl NodeService {
         info!("NodeService: Initializing Embedder...");
         let embedder = BertEmbedder::new();
 
+        // Determine Data Directory early for LanceDB
+        let app_data_dir = if let Some(path) = data_dir.clone() {
+            path
+        } else {
+            let project_dirs = directories_next::ProjectDirs::from("com", "plexus", "mesh")
+                .context("Could not determine data directory")?;
+            project_dirs.data_dir().to_path_buf()
+        };
+        std::fs::create_dir_all(&app_data_dir).context("Failed to create data directory")?;
+
         // Connect to Qdrant or Fallback with Timeout
         info!("NodeService: Connecting to Vector Store...");
         let qdrant_future = async { QdrantStore::new("http://localhost:6334").await };
@@ -183,14 +193,34 @@ impl NodeService {
                 }
                 Ok(Err(e)) => {
                     error!(
-                        "Failed to connect to Qdrant ({}). Falling back to In-Memory Store.",
+                        "Failed to connect to Qdrant ({}). Falling back to LanceDB.",
                         e
                     );
-                    Arc::new(SimpleVectorStore::new())
+                    let lance_path = app_data_dir.join("vectors.lance");
+                    match LanceDbStore::new(&lance_path).await {
+                        Ok(store) => {
+                            info!("Connected to Embedded LanceDB at {:?}", lance_path);
+                            Arc::new(store)
+                        }
+                        Err(e) => {
+                            error!("Failed to init LanceDB: {}. Falling back to In-Memory.", e);
+                            Arc::new(SimpleVectorStore::new())
+                        }
+                    }
                 }
                 Err(_) => {
-                    error!("Qdrant connection timed out. Falling back to In-Memory Store.");
-                    Arc::new(SimpleVectorStore::new())
+                    error!("Qdrant connection timed out. Falling back to LanceDB.");
+                    let lance_path = app_data_dir.join("vectors.lance");
+                    match LanceDbStore::new(&lance_path).await {
+                        Ok(store) => {
+                            info!("Connected to Embedded LanceDB at {:?}", lance_path);
+                            Arc::new(store)
+                        }
+                        Err(e) => {
+                            error!("Failed to init LanceDB: {}. Falling back to In-Memory.", e);
+                            Arc::new(SimpleVectorStore::new())
+                        }
+                    }
                 }
             };
         info!("NodeService: Vector Store initialized.");
