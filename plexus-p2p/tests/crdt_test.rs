@@ -1,6 +1,7 @@
 use plexus_p2p::crdt::MeshState;
 use plexus_p2p::protocol::{Heartbeat, NodeCapabilities};
 use proptest::prelude::*;
+use tempfile::Builder;
 
 // Strategy to generate random Heartbeats
 fn heartbeat_strategy() -> impl Strategy<Value = Heartbeat> {
@@ -26,85 +27,106 @@ fn heartbeat_strategy() -> impl Strategy<Value = Heartbeat> {
         )
 }
 
-// Strategy to generate random MeshStates
-fn mesh_state_strategy() -> impl Strategy<Value = MeshState> {
-    proptest::collection::vec(heartbeat_strategy(), 0..10).prop_map(|heartbeats| {
-        let mut state = MeshState::new();
-        for hb in heartbeats {
-            state.update(hb);
-        }
-        state
-    })
+// Helper to create a temporary DB for tests
+fn create_temp_mesh_state() -> MeshState {
+    let dir = Builder::new().prefix("plexus_crdt_test").tempdir().unwrap();
+    MeshState::new(dir.path().to_path_buf()).expect("Failed to create temp mesh state")
 }
 
+// Property testing for CRDT properties
 proptest! {
     #[test]
     fn test_merge_associativity(
-        a in mesh_state_strategy(),
-        b in mesh_state_strategy(),
-        c in mesh_state_strategy()
+        h1 in proptest::collection::vec(heartbeat_strategy(), 0..5),
+        h2 in proptest::collection::vec(heartbeat_strategy(), 0..5),
+        h3 in proptest::collection::vec(heartbeat_strategy(), 0..5)
     ) {
         // (A + B) + C == A + (B + C)
 
-        // Left side
-        let mut ab = a.clone();
-        ab.merge(b.clone());
-        let mut abc = ab.clone();
-        abc.merge(c.clone());
+        // Setup states
+        let state_abc = create_temp_mesh_state();
+        state_abc.merge(h1.clone()).unwrap();
+        state_abc.merge(h2.clone()).unwrap();
+        state_abc.merge(h3.clone()).unwrap();
 
-        // Right side
-        let mut bc = b.clone();
-        bc.merge(c.clone());
-        let mut a_bc = a.clone();
-        a_bc.merge(bc.clone());
+        let state_a_bc = create_temp_mesh_state();
+        state_a_bc.merge(h1.clone()).unwrap();
 
-        // Assert equality by comparing the internal maps
-        // Note: HashMaps order doesn't matter, but we need meaningful equality check.
-        // Derived Debug on Heartbeat might not be enough if we want strict equality of contents.
-        // We compare expected peers.
+        let state_bc_temp = create_temp_mesh_state(); // helper to simulate B merged then C
+        state_bc_temp.merge(h2.clone()).unwrap();
+        state_bc_temp.merge(h3.clone()).unwrap();
+        let all_bc = state_bc_temp.get_all(); // extract merged result to pass to A
 
-        assert_eq!(abc.peers.len(), a_bc.peers.len());
-        for (k, v) in &abc.peers {
-            assert!(a_bc.peers.contains_key(k));
-            let other_v = a_bc.peers.get(k).unwrap();
-            assert_eq!(v.timestamp, other_v.timestamp);
-            assert_eq!(v.peer_id, other_v.peer_id); // Basic check
+        state_a_bc.merge(all_bc).unwrap();
+
+        // Compare results
+        let final_abc = state_abc.get_all();
+        let final_a_bc = state_a_bc.get_all();
+
+        // Sort by peer_id for deterministic comparison
+        let mut sorted_abc = final_abc.clone();
+        sorted_abc.sort_by_key(|h| h.peer_id.clone());
+
+        let mut sorted_a_bc = final_a_bc.clone();
+        sorted_a_bc.sort_by_key(|h| h.peer_id.clone());
+
+        assert_eq!(sorted_abc.len(), sorted_a_bc.len());
+        for (a, b) in sorted_abc.iter().zip(sorted_a_bc.iter()) {
+            assert_eq!(a.peer_id, b.peer_id);
+            assert_eq!(a.timestamp, b.timestamp);
         }
     }
 
     #[test]
     fn test_merge_commutativity(
-        a in mesh_state_strategy(),
-        b in mesh_state_strategy()
+        h1 in proptest::collection::vec(heartbeat_strategy(), 0..10),
+        h2 in proptest::collection::vec(heartbeat_strategy(), 0..10)
     ) {
         // A + B == B + A
 
-        let mut ab = a.clone();
-        ab.merge(b.clone());
+        let state_ab = create_temp_mesh_state();
+        state_ab.merge(h1.clone()).unwrap();
+        state_ab.merge(h2.clone()).unwrap();
 
-        let mut ba = b.clone();
-        ba.merge(a.clone());
+        let state_ba = create_temp_mesh_state();
+        state_ba.merge(h2.clone()).unwrap();
+        state_ba.merge(h1.clone()).unwrap();
 
-        assert_eq!(ab.peers.len(), ba.peers.len());
-        for (k, v) in &ab.peers {
-             assert!(ba.peers.contains_key(k));
-             let other_v = ba.peers.get(k).unwrap();
-             assert_eq!(v.timestamp, other_v.timestamp);
+        let mut final_ab = state_ab.get_all();
+        final_ab.sort_by_key(|h| h.peer_id.clone());
+
+        let mut final_ba = state_ba.get_all();
+        final_ba.sort_by_key(|h| h.peer_id.clone());
+
+        assert_eq!(final_ab.len(), final_ba.len());
+        for (a, b) in final_ab.iter().zip(final_ba.iter()) {
+            assert_eq!(a.peer_id, b.peer_id);
+            assert_eq!(a.timestamp, b.timestamp);
         }
     }
 
     #[test]
     fn test_merge_idempotency(
-        a in mesh_state_strategy()
+        h1 in proptest::collection::vec(heartbeat_strategy(), 0..10)
     ) {
         // A + A == A
-        let mut aa = a.clone();
-        aa.merge(a.clone());
+        let state_aa = create_temp_mesh_state();
+        state_aa.merge(h1.clone()).unwrap();
+        state_aa.merge(h1.clone()).unwrap();
 
-        assert_eq!(aa.peers.len(), a.peers.len());
-        for (k, v) in &aa.peers {
-            let other_v = a.peers.get(k).unwrap();
-            assert_eq!(v.timestamp, other_v.timestamp);
+        let state_a = create_temp_mesh_state();
+        state_a.merge(h1.clone()).unwrap();
+
+        let mut final_aa = state_aa.get_all();
+        final_aa.sort_by_key(|h| h.peer_id.clone());
+
+        let mut final_a = state_a.get_all();
+        final_a.sort_by_key(|h| h.peer_id.clone());
+
+        assert_eq!(final_aa.len(), final_a.len());
+        for (a, b) in final_aa.iter().zip(final_a.iter()) {
+            assert_eq!(a.peer_id, b.peer_id);
+            assert_eq!(a.timestamp, b.timestamp);
         }
     }
 }
