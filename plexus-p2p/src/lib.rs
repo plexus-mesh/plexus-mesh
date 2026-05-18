@@ -8,4 +8,4 @@ pub use crdt::MeshState;
 pub use identity::IdentityStore;
 pub use node_service::{NodeCommand, NodeService, NodeStatus, SystemCapabilities};
 pub use protocol::{GenerateRequest, GenerateResponse, Heartbeat, NodeCapabilities};
-pub use swarm::{build_swarm, PlexusBehaviour};
+pub use swarm::{build_swarm_safe, PlexusBehaviour};

@@ -22,9 +22,11 @@ crdts = "7.3.2"
 sled = "0.34"
 directories-next = "2.0"
 uuid = { version = "1.20.0", features = ["v4"] }
+chrono = "0.4"
+
 
 [features]
-default = ["lancedb"]
+default = []
 lancedb = ["plexus-ai/lancedb"]
 
 [dev-dependencies]
