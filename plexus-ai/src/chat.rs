@@ -64,23 +64,40 @@ impl ChatHistory {
         self.messages.clear();
     }
 
-    pub fn format_for_llama(&self) -> String {
-        let mut formatted = String::new();
+    pub fn format_for_llama(&self, ephemeral_system_ctx: Option<String>) -> String {
+        let mut formatted = String::from("<|begin_of_text|>");
+
+        if let Some(ctx) = ephemeral_system_ctx {
+            formatted.push_str(&format!(
+                "<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>",
+                ctx
+            ));
+        }
+
         for msg in &self.messages {
             match msg.role {
                 Role::User => {
-                    formatted.push_str(&format!("<|user|>\n{}</s>\n", msg.content));
+                    formatted.push_str(&format!(
+                        "<|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>",
+                        msg.content
+                    ));
                 }
                 Role::Assistant => {
-                    formatted.push_str(&format!("<|assistant|>\n{}</s>\n", msg.content));
+                    formatted.push_str(&format!(
+                        "<|start_header_id|>assistant<|end_header_id|>\n\n{}<|eot_id|>",
+                        msg.content
+                    ));
                 }
                 Role::System => {
-                    formatted.push_str(&format!("<|system|>\n{}</s>\n", msg.content));
+                    formatted.push_str(&format!(
+                        "<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>",
+                        msg.content
+                    ));
                 }
             }
         }
         // Prepare for next assistant response
-        formatted.push_str("<|assistant|>\n");
+        formatted.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
         formatted
     }
 

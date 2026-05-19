@@ -2,10 +2,14 @@ mod engine;
 #[cfg(feature = "lancedb")]
 mod lance_store;
 mod memory;
+mod mock;
+mod ollama;
 pub use engine::TinyLlamaEngine;
 #[cfg(feature = "lancedb")]
 pub use lance_store::LanceDbStore;
 pub use memory::{BertEmbedder, QdrantStore, SimpleVectorStore};
+pub use mock::MockEngine;
+pub use ollama::OllamaEngine;
 pub mod chat;
 pub use chat::{ChatHistory, ChatMessage, Role};
 pub mod voice;

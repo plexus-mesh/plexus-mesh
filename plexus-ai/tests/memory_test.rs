@@ -3,7 +3,7 @@ use plexus_ai::{BertEmbedder, SimpleVectorStore, VectorStore};
 #[tokio::test]
 async fn test_vector_memory() -> anyhow::Result<()> {
     // 1. Initialize Embedder and Store
-    let embedder = BertEmbedder::new();
+    let embedder = BertEmbedder::new(None);
     let store = SimpleVectorStore::new();
 
     // 2. Generate Embeddings (this triggers download, might be slow on first run)

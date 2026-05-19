@@ -10,21 +10,24 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::VectorStore;
 use std::convert::TryInto; // For payload conversion
+use std::path::PathBuf;
 
-const BERT_REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
+const BERT_REPO: &str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2";
 
 pub struct BertEmbedder {
     model: Arc<Mutex<Option<BertModel>>>,
     tokenizer: Arc<Mutex<Option<Tokenizer>>>,
     loading: Arc<AsyncMutex<bool>>,
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl BertEmbedder {
-    pub fn new() -> Self {
+    pub fn new(data_dir: Option<std::path::PathBuf>) -> Self {
         Self {
             model: Arc::new(Mutex::new(None)),
             tokenizer: Arc::new(Mutex::new(None)),
             loading: Arc::new(AsyncMutex::new(false)),
+            data_dir,
         }
     }
 
@@ -37,33 +40,77 @@ impl BertEmbedder {
 
         let mut loading_guard = self.loading.lock().await;
         if *loading_guard {
-            // In real app wait here
             return Ok(());
         }
         *loading_guard = true;
 
-        println!("Downloading Embedding Model (all-MiniLM-L6-v2)...");
-        let api = Api::new()?;
-        let repo = api.repo(Repo::new(BERT_REPO.to_string(), RepoType::Model));
+        // --- Strategy: Try LOCAL files first (pre-downloaded by Dart), then fallback to HF ---
+        let (config_path, tokenizer_path, weights_path) = if let Some(ref dir) = self.data_dir {
+            let embedder_dir = dir.join("embedder");
+            let local_config = embedder_dir.join("config.json");
+            let local_tokenizer = embedder_dir.join("tokenizer.json");
+            let local_weights = embedder_dir.join("model.safetensors");
 
-        let config_filename = repo.get("config.json").await?;
-        let tokenizer_filename = repo.get("tokenizer.json").await?;
-        let weights_filename = repo.get("model.safetensors").await?;
+            if local_config.exists() && local_tokenizer.exists() && local_weights.exists() {
+                println!(
+                    "BertEmbedder: Loading from pre-downloaded local files at {:?}",
+                    embedder_dir
+                );
+                (local_config, local_tokenizer, local_weights)
+            } else {
+                println!("BertEmbedder: Local files not found. Downloading from HuggingFace...");
+                match self.download_from_hf().await {
+                    Ok(paths) => paths,
+                    Err(e) => {
+                        *loading_guard = false;
+                        return Err(e);
+                    }
+                }
+            }
+        } else {
+            println!("BertEmbedder: No data_dir. Downloading from HuggingFace...");
+            match self.download_from_hf().await {
+                Ok(paths) => paths,
+                Err(e) => {
+                    *loading_guard = false;
+                    return Err(e);
+                }
+            }
+        };
 
-        let config = std::fs::read_to_string(config_filename)?;
-        let config: Config = serde_json::from_str(&config)?;
+        // --- Load model from resolved paths ---
+        let config_str = std::fs::read_to_string(&config_path).map_err(|e| {
+            *loading_guard = false;
+            E::msg(format!("Failed to read config: {}", e))
+        })?;
 
-        let mut tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
+        let config: Config = serde_json::from_str(&config_str).map_err(|e| {
+            *loading_guard = false;
+            E::msg(format!("Failed to parse config: {}", e))
+        })?;
+
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+            *loading_guard = false;
+            E::msg(format!("Failed to load tokenizer: {}", e))
+        })?;
+
         let pp = PaddingParams {
             strategy: tokenizers::PaddingStrategy::BatchLongest,
             ..Default::default()
         };
         tokenizer.with_padding(Some(pp));
 
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_filename], DTYPE, &Device::Cpu)?
-        };
-        let model = BertModel::load(vb, &config)?;
+        let vb =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &Device::Cpu) }
+                .map_err(|e| {
+                    *loading_guard = false;
+                    E::msg(format!("Failed to load weights: {}", e))
+                })?;
+
+        let model = BertModel::load(vb, &config).map_err(|e| {
+            *loading_guard = false;
+            E::msg(format!("Failed to init BertModel: {}", e))
+        })?;
 
         {
             let mut m_guard = self.model.lock().unwrap();
@@ -75,6 +122,35 @@ impl BertEmbedder {
         println!("Embedding Model Loaded.");
         *loading_guard = false;
         Ok(())
+    }
+
+    /// Fallback: Download model files from HuggingFace (works on non-sandboxed environments)
+    async fn download_from_hf(&self) -> Result<(PathBuf, PathBuf, PathBuf)> {
+        println!("Downloading Embedding Model ({})...", BERT_REPO);
+        let mut builder = hf_hub::api::tokio::ApiBuilder::new();
+        if let Some(ref dir) = self.data_dir {
+            builder = builder.with_cache_dir(dir.clone());
+        }
+
+        let api = builder
+            .build()
+            .map_err(|e| E::msg(format!("Failed to init HF API: {}", e)))?;
+        let repo = api.repo(Repo::new(BERT_REPO.to_string(), RepoType::Model));
+
+        let config_path = repo
+            .get("config.json")
+            .await
+            .map_err(|e| E::msg(format!("Failed to download config.json: {}", e)))?;
+        let tokenizer_path = repo
+            .get("tokenizer.json")
+            .await
+            .map_err(|e| E::msg(format!("Failed to download tokenizer.json: {}", e)))?;
+        let weights_path = repo
+            .get("model.safetensors")
+            .await
+            .map_err(|e| E::msg(format!("Failed to download model.safetensors: {}", e)))?;
+
+        Ok((config_path, tokenizer_path, weights_path))
     }
 
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
@@ -113,14 +189,35 @@ fn normalize_l2(v: &Tensor) -> Result<Tensor> {
 }
 
 pub struct SimpleVectorStore {
-    // Map ID -> (Vector, Text)
     data: Arc<Mutex<HashMap<String, (Vec<f32>, String)>>>,
+    path: Option<std::path::PathBuf>,
 }
 
 impl SimpleVectorStore {
-    pub fn new() -> Self {
+    pub fn new(path: Option<std::path::PathBuf>) -> Self {
+        let mut map = HashMap::new();
+        if let Some(p) = &path {
+            if p.exists() {
+                if let Ok(file) = std::fs::File::open(p) {
+                    if let Ok(loaded) = serde_json::from_reader(file) {
+                        map = loaded;
+                    }
+                }
+            }
+        }
         Self {
-            data: Arc::new(Mutex::new(HashMap::new())),
+            data: Arc::new(Mutex::new(map)),
+            path,
+        }
+    }
+
+    fn save_to_disk(&self) {
+        if let Some(p) = &self.path {
+            if let Ok(data) = self.data.lock() {
+                if let Ok(file) = std::fs::File::create(p) {
+                    let _ = serde_json::to_writer(file, &*data);
+                }
+            }
         }
     }
 }
@@ -132,8 +229,11 @@ impl VectorStore for SimpleVectorStore {
     }
 
     async fn add_document(&self, id: &str, text: &str, vector: Vec<f32>) -> Result<()> {
-        let mut data = self.data.lock().unwrap();
-        data.insert(id.to_string(), (vector, text.to_string()));
+        {
+            let mut data = self.data.lock().unwrap();
+            data.insert(id.to_string(), (vector, text.to_string()));
+        }
+        self.save_to_disk();
         Ok(())
     }
 
