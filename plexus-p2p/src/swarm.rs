@@ -56,10 +56,20 @@ pub async fn build_swarm_safe(keypair: Keypair) -> Result<Swarm<PlexusBehaviour>
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(15))
         .validation_mode(gossipsub::ValidationMode::Strict)
-        // Mesh parameters tuned for small personal networks (2-10 nodes)
+        // Mesh parameters tuned for small personal networks (2-10 nodes).
+        //
+        // libp2p gossipsub enforces `mesh_outbound_min <= mesh_n / 2` at
+        // build time. The crate's default `mesh_outbound_min` is 2, but
+        // we picked `mesh_n = 3` for tiny meshes — integer division gives
+        // `3 / 2 = 1`, so the default 2 fails validation and `build()`
+        // returns "The inequality doesn't hold mesh_outbound_min <=
+        // self.config.mesh_n / 2", which used to crash the node on
+        // every boot. Set it to 1 explicitly so the small-mesh design
+        // intent is encoded in source.
         .mesh_n(3)
         .mesh_n_low(2)
         .mesh_n_high(6)
+        .mesh_outbound_min(1)
         .gossip_lazy(3)
         .history_length(5)
         .history_gossip(3)
