@@ -31,7 +31,12 @@ arrow-schema = { version = "56.2.0", optional = true }
 futures.workspace = true
 
 # HNSW Index (Pure Rust, zero C/C++ deps - compiles to iOS/Android/macOS/Windows)
-hnsw = { version = "0.11", features = ["serde"] }
+# Use the `serde1` feature, NOT `serde`: `serde` alone derives Serialize/
+# Deserialize on the index structs but leaves `smallvec/serde` off, so
+# `SmallVec` fields fail to satisfy the serde bounds. `serde1` pulls in both
+# (`serde1 = ["smallvec/serde", "serde"]`). The standalone workspace has no
+# other crate enabling `smallvec/serde`, so the wrong flag breaks the build.
+hnsw = { version = "0.11", features = ["serde1"] }
 space = "0.17"
 
 [features]

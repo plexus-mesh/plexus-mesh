@@ -1,4 +1,4 @@
-use crate::{GenerateRequest, GenerateResponse};
+use crate::{GenerateRequest, GenerateResponse, SyncRequest, SyncResponse};
 use anyhow::{Context, Result};
 use libp2p::{
     dcutr, gossipsub,
@@ -27,6 +27,11 @@ pub struct PlexusBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub request_response: cbor::Behaviour<GenerateRequest, GenerateResponse>,
+    /// Point-to-point anti-entropy (Merkle reconciliation, step 5). Separate
+    /// from `request_response` (compute offload) so the two never share a
+    /// protocol or get parsed against each other. Payloads are opaque sealed
+    /// envelopes — see [`SyncRequest`].
+    pub sync_rr: cbor::Behaviour<SyncRequest, SyncResponse>,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
 }
@@ -107,6 +112,19 @@ pub async fn build_swarm_safe(keypair: Keypair) -> Result<Swarm<PlexusBehaviour>
         rr_config,
     );
 
+    // ── Sync Request-Response (Merkle reconciliation) ────────────────────
+    // Its own protocol and a tighter timeout: a summary exchange is a couple
+    // of small encrypted blobs, not a minutes-long model generation.
+    let mut sync_rr_config = request_response::Config::default();
+    sync_rr_config.set_request_timeout(Duration::from_secs(60));
+    let sync_rr = cbor::Behaviour::new(
+        [(
+            StreamProtocol::new("/plexus/sync/1.0.0"),
+            ProtocolSupport::Full,
+        )],
+        sync_rr_config,
+    );
+
     info!("build_swarm: Configuring transport stack...");
 
     // ── Transport: TCP + QUIC + Relay, all with Noise encryption ─────────
@@ -133,6 +151,7 @@ pub async fn build_swarm_safe(keypair: Keypair) -> Result<Swarm<PlexusBehaviour>
                 gossipsub,
                 kademlia,
                 request_response,
+                sync_rr,
                 relay_client,
                 dcutr,
             })

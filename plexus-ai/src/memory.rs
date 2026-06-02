@@ -163,25 +163,133 @@ impl BertEmbedder {
         let tokenizer_guard = self.tokenizer.lock().unwrap();
         let tokenizer = tokenizer_guard.as_ref().unwrap();
 
+        // Split long inputs into token-bounded chunks. This model is distilled
+        // from a teacher trained on <=128-token inputs; feeding a whole journal
+        // entry as one sequence pushes the mean-pool well outside the model's
+        // competent range (and past `max_position_embeddings` it isn't even
+        // representable). We embed each chunk separately and mean-pool the
+        // resulting unit vectors into one document vector — the standard
+        // "average of chunk embeddings" strategy for long-document retrieval.
+        let chunks = Self::chunk_text(tokenizer, text)?;
+
+        let mut acc: Vec<f32> = Vec::new();
+        let mut count = 0usize;
+        for chunk in &chunks {
+            let v = Self::embed_chunk(model, tokenizer, chunk)?;
+            if acc.is_empty() {
+                acc = vec![0.0f32; v.len()];
+            }
+            for (a, x) in acc.iter_mut().zip(v.iter()) {
+                *a += *x;
+            }
+            count += 1;
+        }
+
+        if count == 0 || acc.is_empty() {
+            return Err(E::msg("embed: no usable content in input"));
+        }
+
+        // Average, then re-normalise to unit length so downstream cosine
+        // similarity stays in the same scale as a single-chunk embedding.
+        let inv = 1.0 / count as f32;
+        for a in acc.iter_mut() {
+            *a *= inv;
+        }
+        let norm: f32 = acc.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-12 {
+            for a in acc.iter_mut() {
+                *a /= norm;
+            }
+        }
+        Ok(acc)
+    }
+
+    /// Embed a single already-short chunk: tokenise (with special tokens),
+    /// run the encoder, mean-pool over the sequence, and L2-normalise.
+    ///
+    /// Mean pooling here divides by the full token count, which includes the
+    /// `[CLS]`/`[SEP]` markers — this matches the reference sentence-
+    /// transformers mean-pooling for a single, unpadded sequence (every
+    /// attention-mask position is summed).
+    fn embed_chunk(model: &BertModel, tokenizer: &Tokenizer, text: &str) -> Result<Vec<f32>> {
         let tokens = tokenizer.encode(text, true).map_err(E::msg)?;
         let token_ids = tokens.get_ids();
         let token_ids = Tensor::new(token_ids, &Device::Cpu)?.unsqueeze(0)?;
         let token_type_ids = token_ids.zeros_like()?;
 
-        // Calculate embeddings
-        // forward(input_ids, token_type_ids, position_ids)
-        // Check signature: error said arg #3 is Option<&Tensor>
+        // forward(input_ids, token_type_ids, attention_mask: Option<&Tensor>)
         let embeddings = model.forward(&token_ids, &token_type_ids, None)?;
 
-        // Mean pooling
         let (_n_sentence, n_tokens, _hidden_size) = embeddings.dims3()?;
         let embeddings = (embeddings.sum(1)? / (n_tokens as f64))?;
         let embeddings = normalize_l2(&embeddings)?;
-
         let vec = embeddings.get(0)?.to_vec1::<f32>()?;
         Ok(vec)
     }
+
+    /// Split `text` into overlapping windows of at most [`CHUNK_TOKENS`]
+    /// tokens, returning the exact original-text substrings for each window.
+    ///
+    /// Boundaries come from the tokenizer's own byte offsets rather than a
+    /// decode round-trip, so the slices are script-aware and lossless. The
+    /// `[CHUNK_OVERLAP_TOKENS]`-token overlap keeps a concept that straddles a
+    /// boundary fully inside at least one window. Short inputs return a single
+    /// chunk (the whole text), so the common case pays no extra cost.
+    fn chunk_text(tokenizer: &Tokenizer, text: &str) -> Result<Vec<String>> {
+        // Encode WITHOUT special tokens purely to locate offsets — the model
+        // is never run here, so length is irrelevant and can't overflow.
+        let enc = tokenizer.encode(text, false).map_err(E::msg)?;
+        Ok(slice_windows(text, enc.get_offsets()))
+    }
 }
+
+/// Window `text` into overlapping slices using token byte-`offsets`.
+///
+/// Pure (no tokenizer/model state) so the windowing arithmetic can be unit
+/// tested directly. Returns the whole text as a single chunk when it fits in
+/// one window; otherwise emits [`CHUNK_TOKENS`]-token windows advancing by
+/// `CHUNK_TOKENS - CHUNK_OVERLAP_TOKENS` each step.
+fn slice_windows(text: &str, offsets: &[(usize, usize)]) -> Vec<String> {
+    let n = offsets.len();
+    if n <= CHUNK_TOKENS {
+        return vec![text.to_string()];
+    }
+
+    let step = CHUNK_TOKENS.saturating_sub(CHUNK_OVERLAP_TOKENS).max(1);
+    let mut chunks = Vec::new();
+    let mut start_tok = 0usize;
+    while start_tok < n {
+        let end_tok = (start_tok + CHUNK_TOKENS).min(n);
+        let start_byte = offsets[start_tok].0;
+        let end_byte = offsets[end_tok - 1].1;
+        if start_byte < end_byte {
+            if let Some(slice) = text.get(start_byte..end_byte) {
+                let trimmed = slice.trim();
+                if !trimmed.is_empty() {
+                    chunks.push(trimmed.to_string());
+                }
+            }
+        }
+        if end_tok == n {
+            break;
+        }
+        start_tok += step;
+    }
+
+    if chunks.is_empty() {
+        chunks.push(text.to_string());
+    }
+    chunks
+}
+
+/// Maximum number of (content) tokens per embedding chunk. Matches the
+/// teacher model's training sequence length for `paraphrase-multilingual-
+/// MiniLM-L12-v2`; with the two added special tokens this stays far under the
+/// 512-position model limit.
+const CHUNK_TOKENS: usize = 128;
+
+/// Sliding-window overlap between adjacent chunks, in tokens.
+const CHUNK_OVERLAP_TOKENS: usize = 16;
 
 fn normalize_l2(v: &Tensor) -> Result<Tensor> {
     let norm = v.sqr()?.sum_keepdim(1)?.sqrt()?;
@@ -355,5 +463,70 @@ impl VectorStore for QdrantStore {
             }
         }
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build synthetic contiguous token offsets over `text`: `count` tokens
+    /// each spanning `width` bytes. Good enough to exercise the windowing
+    /// arithmetic without loading a real tokenizer/model.
+    fn fake_offsets(count: usize, width: usize) -> Vec<(usize, usize)> {
+        (0..count).map(|i| (i * width, (i + 1) * width)).collect()
+    }
+
+    #[test]
+    fn short_text_is_a_single_chunk() {
+        let text = "a short entry";
+        // Fewer/equal tokens than the window → whole text returned verbatim.
+        let offsets = fake_offsets(CHUNK_TOKENS, 1);
+        let chunks = slice_windows(text, &offsets);
+        assert_eq!(chunks, vec![text.to_string()]);
+    }
+
+    #[test]
+    fn long_text_splits_into_overlapping_windows() {
+        // 2x the window plus a bit → expect multiple chunks.
+        let n_tokens = CHUNK_TOKENS * 2 + 10;
+        let text: String = "x".repeat(n_tokens); // 1 byte per token
+        let offsets = fake_offsets(n_tokens, 1);
+        let chunks = slice_windows(&text, &offsets);
+
+        assert!(chunks.len() >= 2, "long input must produce >1 chunk");
+
+        // Every chunk stays within the model's token budget (1 byte/token here).
+        for c in &chunks {
+            assert!(
+                c.len() <= CHUNK_TOKENS,
+                "chunk len {} exceeds CHUNK_TOKENS {}",
+                c.len(),
+                CHUNK_TOKENS
+            );
+        }
+
+        // Windows advance by (CHUNK_TOKENS - overlap); the last window reaches
+        // the final token, so the union covers the whole input (no dropped
+        // content).
+        let step = CHUNK_TOKENS - CHUNK_OVERLAP_TOKENS;
+        let last_start = (chunks.len() - 1) * step;
+        let covered = last_start + chunks.last().unwrap().len();
+        assert!(covered >= n_tokens, "windows must cover the full input");
+    }
+
+    #[test]
+    fn adjacent_windows_overlap() {
+        let n_tokens = CHUNK_TOKENS + 50;
+        let text: String = ('a'..='z').cycle().take(n_tokens).collect();
+        let offsets = fake_offsets(n_tokens, 1);
+        let chunks = slice_windows(&text, &offsets);
+        assert!(chunks.len() >= 2);
+        // The tail of chunk 0 should reappear at the head of chunk 1.
+        let overlap_tail = &chunks[0][chunks[0].len() - CHUNK_OVERLAP_TOKENS..];
+        assert!(
+            chunks[1].starts_with(overlap_tail),
+            "expected {CHUNK_OVERLAP_TOKENS}-token overlap between windows"
+        );
     }
 }

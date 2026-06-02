@@ -40,4 +40,23 @@ pub trait VectorStore: Send + Sync {
 
     /// Search for nearest neighbors
     async fn search(&self, query_vector: Vec<f32>, k: usize) -> Result<Vec<(String, f32)>>;
+
+    /// Search for nearest neighbors, restricted by optional metadata filters.
+    ///
+    /// Stores that understand `source_type` / `date_key` metadata (e.g. the
+    /// SQLCipher-backed store) should override this to filter *inside* the
+    /// index, where the query embedding and any over-fetch/fallback logic
+    /// live — that's far more accurate than letting the caller post-filter a
+    /// fixed top-k after the fact. Stores without metadata fall back to the
+    /// unfiltered [`VectorStore::search`] via this default.
+    async fn search_filtered(
+        &self,
+        query_vector: Vec<f32>,
+        k: usize,
+        _source_type: Option<String>,
+        _date_from: Option<String>,
+        _date_to: Option<String>,
+    ) -> Result<Vec<(String, f32)>> {
+        self.search(query_vector, k).await
+    }
 }

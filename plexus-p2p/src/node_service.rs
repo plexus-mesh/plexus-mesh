@@ -2,7 +2,7 @@ use crate::{
     build_swarm_safe,
     protocol::{Heartbeat, NodeCapabilities},
     swarm::PlexusBehaviourEvent,
-    GenerateRequest, GenerateResponse, IdentityStore, PlexusBehaviour,
+    GenerateRequest, GenerateResponse, IdentityStore, PlexusBehaviour, SyncRequest, SyncResponse,
 };
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use sysinfo::{Networks, System};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{interval, Duration, Instant};
 use tracing::{error, info, warn};
 
@@ -82,6 +82,29 @@ pub enum NodeCommand {
         limit: usize,
         respond_to: mpsc::Sender<Result<Vec<(String, f32)>, String>>,
     },
+    /// Like [`NodeCommand::Search`] but restricts results by metadata
+    /// (`source_type` and/or a `date_key` range, all `YYYY-MM-DD`). Filtering
+    /// happens inside the vector store, alongside the embedding and any
+    /// over-fetch/fallback logic — see `VectorStore::search_filtered`.
+    SearchFiltered {
+        query: String,
+        limit: usize,
+        source_type: Option<String>,
+        date_from: Option<String>,
+        date_to: Option<String>,
+        respond_to: mpsc::Sender<Result<Vec<(String, f32)>, String>>,
+    },
+    /// Embed `content` and store it under a caller-supplied `id`, so the app's
+    /// memory UUID and the Rust CRDT row share a primary key. This is what lets
+    /// the UI address a record's attachments by the same id it already holds.
+    /// Contrast the `/save ` shorthand in [`NodeCommand::Generate`], which mints
+    /// a throwaway timestamp id the caller never sees — fine for daily summaries
+    /// (deduped by metadata), but useless for per-record attachment linking.
+    SaveWithId {
+        id: String,
+        content: String,
+        respond_to: mpsc::Sender<Result<(), String>>,
+    },
     /// Connect to a paired device by its multiaddr (supports relay addresses).
     ConnectPeer {
         address: String,
@@ -98,6 +121,68 @@ pub enum NodeCommand {
         query: String,
         respond_to: mpsc::Sender<Result<String, String>>,
     },
+    /// Publish an already-encrypted CRDT sync payload to the sync gossipsub
+    /// topic. Fire-and-forget: gossipsub is best-effort, so a publish with
+    /// no current subscribers simply no-ops (the record will be picked up
+    /// later by Merkle reconciliation — step 5). The bytes are opaque to
+    /// the mesh layer; they're a `core::crypto` envelope wrapping a
+    /// `core::sync_wire::WireRecord`, sealed by the app before it gets here.
+    PublishSync {
+        data: Vec<u8>,
+    },
+    /// Install (or replace) the sink that received sync-topic payloads are
+    /// forwarded to. The app side drains this channel, decrypts, and feeds
+    /// each payload to its LWW merge (`apply_remote`). Sent once during
+    /// node startup — kept as a runtime command rather than a constructor
+    /// arg so `NodeService::new`'s signature stays stable for the other
+    /// (non-Mindora) binaries that call it.
+    SetSyncSink {
+        sender: mpsc::Sender<Vec<u8>>,
+    },
+    /// Install the channel the swarm uses to ask the app for Merkle
+    /// reconciliation data (step 5). Like [`NodeCommand::SetSyncSink`], it's a
+    /// runtime command so `NodeService::new`'s signature stays stable. The app
+    /// drains the channel and answers each [`ReconcileQuery`]; while no
+    /// responder is installed the swarm simply doesn't initiate or answer
+    /// anti-entropy (gossipsub live-push still works).
+    SetReconcileResponder {
+        sender: mpsc::Sender<ReconcileQuery>,
+    },
+}
+
+/// A reconciliation question the swarm asks the app to answer. Every byte
+/// blob is an opaque `core::crypto` envelope — the mesh layer never sees
+/// plaintext, it only shuttles sealed bodies between the wire and the app.
+#[derive(Debug)]
+pub enum ReconcileQuery {
+    /// "Give me my own sealed Merkle summary to advertise to a peer." The app
+    /// replies with the sealed summary, or an empty `Vec` if this device is
+    /// unpaired (nothing to advertise → the swarm won't initiate).
+    Summary { reply: oneshot::Sender<Vec<u8>> },
+    /// "A peer advertised this sealed summary — which of my records should I
+    /// send back?" The app opens it, diffs it against its own tree, and
+    /// replies with the sealed records for the differing day buckets (empty
+    /// if unpaired or the summary won't open under any held key).
+    Diff {
+        peer_summary: Vec<u8>,
+        reply: oneshot::Sender<Vec<Vec<u8>>>,
+    },
+    /// "Give me my own sealed blob have-set to advertise to a peer" (step 7).
+    /// The app replies with its sealed set of attachment-blob hashes, or an
+    /// empty `Vec` if unpaired (→ the swarm won't advertise blobs).
+    BlobHaveSet { reply: oneshot::Sender<Vec<u8>> },
+    /// "A peer advertised this sealed blob have-set — which of my blobs is it
+    /// missing?" The app opens it, computes the set difference, and replies
+    /// with the sealed blob payloads to send back (empty if unpaired or the
+    /// have-set won't open under any held key).
+    BlobDiff {
+        peer_haveset: Vec<u8>,
+        reply: oneshot::Sender<Vec<Vec<u8>>>,
+    },
+    /// "Store these sealed blobs a peer sent me" (step 7). Fire-and-forget:
+    /// the app opens each envelope and puts it into the content-addressed
+    /// store (verifying the hash). No reply — mirrors the record inbound sink.
+    IngestBlobs { sealed_blobs: Vec<Vec<u8>> },
 }
 
 use tokio::sync::Mutex;
@@ -119,6 +204,20 @@ pub struct NodeService {
     system: System,
     mesh_state: crate::crdt::MeshState,
     heartbeat_topic: IdentTopic,
+    /// Gossipsub topic carrying encrypted CRDT record pushes between paired
+    /// devices. Separate from the heartbeat topic so the message handler can
+    /// dispatch by topic hash without sniffing payloads.
+    sync_topic: IdentTopic,
+    /// Sink for inbound sync-topic payloads, installed via
+    /// [`NodeCommand::SetSyncSink`]. `None` until the app wires it up; while
+    /// `None`, received sync messages are dropped (the app isn't ready to
+    /// merge them yet, and Merkle reconciliation will recover anything missed).
+    sync_inbound: Option<mpsc::Sender<Vec<u8>>>,
+    /// Channel the swarm uses to ask the app for reconciliation data,
+    /// installed via [`NodeCommand::SetReconcileResponder`]. `None` until the
+    /// app wires it up; while `None`, anti-entropy is inert (the device never
+    /// initiates a summary exchange and answers inbound ones with nothing).
+    sync_responder: Option<mpsc::Sender<ReconcileQuery>>,
     active_model: String,
     /// Known paired peers for auto-reconnection
     paired_peers: Vec<(PeerId, Multiaddr)>,
@@ -319,6 +418,12 @@ impl NodeService {
             .gossipsub
             .subscribe(&heartbeat_topic)?;
 
+        // CRDT live-push topic. Subscribing unconditionally is safe: without
+        // a pair key the app can't decrypt anything it receives here, so the
+        // worst case is wasted gossip relay work, not a data leak.
+        let sync_topic = IdentTopic::new("plexus-mesh/sync/1.0.0");
+        swarm.behaviour_mut().gossipsub.subscribe(&sync_topic)?;
+
         info!("NodeService: Initializing Persistence...");
 
         let data_dir = if let Some(path) = data_dir {
@@ -351,6 +456,9 @@ impl NodeService {
             system,
             mesh_state,
             heartbeat_topic,
+            sync_topic,
+            sync_inbound: None,
+            sync_responder: None,
             active_model: model_id,
             paired_peers: Vec::new(),
             relay_addr: None,
@@ -491,7 +599,20 @@ impl NodeService {
                             info!("Listening on {:?}", address);
                         }
                         SwarmEvent::Behaviour(PlexusBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source: _peer_id, message_id: _id, message })) => {
-                            if let Ok(heartbeat) = serde_json::from_slice::<Heartbeat>(&message.data) {
+                            // Dispatch by topic hash so the heartbeat and the
+                            // sync streams never get parsed against each other.
+                            if message.topic == self.sync_topic.hash() {
+                                // Opaque encrypted CRDT payload. Hand it to the
+                                // app's sink if installed; otherwise drop it
+                                // (Merkle reconciliation will recover later).
+                                if let Some(sink) = &self.sync_inbound {
+                                    if let Err(e) = sink.try_send(message.data) {
+                                        warn!("Sync inbound sink full/closed, dropping record: {}", e);
+                                    }
+                                } else {
+                                    tracing::debug!("Received sync record but no sink installed yet; dropping");
+                                }
+                            } else if let Ok(heartbeat) = serde_json::from_slice::<Heartbeat>(&message.data) {
                                 info!("Received Heartbeat from {}: {} Cores, {} MB RAM",
                                     heartbeat.peer_id,
                                     heartbeat.capabilities.cpu_cores,
@@ -516,6 +637,9 @@ impl NodeService {
                             info!("Connection established with {}", peer_id);
                             // Reset backoff on successful connection
                             self.reconnect_backoff.remove(&peer_id);
+                            // Anti-entropy: catch up anything missed while one
+                            // of us was offline. No-op unless paired.
+                            self.initiate_reconcile(peer_id).await;
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             info!("Connection closed with {}", peer_id);
@@ -575,6 +699,100 @@ impl NodeService {
                                         let _ = tx.send(Ok(response.response)).await;
                                     }
                                 }
+                            }
+                        }
+                        SwarmEvent::Behaviour(PlexusBehaviourEvent::SyncRr(
+                            request_response::Event::Message { peer, message }
+                        )) => {
+                            match message {
+                                // A peer advertised its sealed Merkle summary.
+                                // Ask the app which of our records differ and
+                                // ship them straight back as the response.
+                                request_response::Message::Request { request, channel, .. } => {
+                                    // Two request kinds share this protocol; each
+                                    // maps to its own ReconcileQuery and reply.
+                                    let response = match request {
+                                        SyncRequest::Summary { sealed_summary } => {
+                                            info!("Sync summary from {} ({} bytes)", peer, sealed_summary.len());
+                                            let sealed_records = match &self.sync_responder {
+                                                Some(responder) => {
+                                                    let (tx, rx) = oneshot::channel();
+                                                    if responder
+                                                        .send(ReconcileQuery::Diff { peer_summary: sealed_summary, reply: tx })
+                                                        .await
+                                                        .is_ok()
+                                                    {
+                                                        rx.await.unwrap_or_default()
+                                                    } else {
+                                                        Vec::new()
+                                                    }
+                                                }
+                                                None => Vec::new(),
+                                            };
+                                            SyncResponse::Records { sealed_records }
+                                        }
+                                        SyncRequest::BlobHaveSet { sealed_haveset } => {
+                                            info!("Blob have-set from {} ({} bytes)", peer, sealed_haveset.len());
+                                            let sealed_blobs = match &self.sync_responder {
+                                                Some(responder) => {
+                                                    let (tx, rx) = oneshot::channel();
+                                                    if responder
+                                                        .send(ReconcileQuery::BlobDiff { peer_haveset: sealed_haveset, reply: tx })
+                                                        .await
+                                                        .is_ok()
+                                                    {
+                                                        rx.await.unwrap_or_default()
+                                                    } else {
+                                                        Vec::new()
+                                                    }
+                                                }
+                                                None => Vec::new(),
+                                            };
+                                            SyncResponse::Blobs { sealed_blobs }
+                                        }
+                                    };
+                                    let _ = self
+                                        .swarm
+                                        .behaviour_mut()
+                                        .sync_rr
+                                        .send_response(channel, response);
+                                }
+                                request_response::Message::Response { response, .. } => match response {
+                                    // The records we're missing arrived. Feed each
+                                    // through the same inbound sink as live-push so
+                                    // they hit `ingest_sealed` (decrypt → LWW merge).
+                                    SyncResponse::Records { sealed_records } => {
+                                        info!("Sync delivered {} records", sealed_records.len());
+                                        if let Some(sink) = &self.sync_inbound {
+                                            for record in sealed_records {
+                                                if let Err(e) = sink.try_send(record) {
+                                                    warn!("Sync inbound sink full/closed during reconcile: {}", e);
+                                                }
+                                            }
+                                        } else {
+                                            tracing::debug!("Reconcile records arrived but no sink installed; dropping");
+                                        }
+                                    }
+                                    // The blobs we're missing arrived. Hand them to
+                                    // the app to open + store (content-addressed,
+                                    // hash-verified) via the responder channel.
+                                    SyncResponse::Blobs { sealed_blobs } => {
+                                        info!("Sync delivered {} blobs", sealed_blobs.len());
+                                        if sealed_blobs.is_empty() {
+                                            // nothing to ingest
+                                        } else if let Some(responder) = &self.sync_responder {
+                                            if responder
+                                                .send(ReconcileQuery::IngestBlobs { sealed_blobs })
+                                                .await
+                                                .is_err()
+                                            {
+                                                warn!("Reconcile responder dropped; blobs not ingested");
+                                            }
+                                        } else {
+                                            tracing::debug!("Reconcile blobs arrived but no responder installed; dropping");
+                                        }
+                                    }
+                                },
                             }
                         }
                         SwarmEvent::Behaviour(_) => {}
@@ -735,6 +953,24 @@ impl NodeService {
                                 }
                             }
                         }
+                        Some(NodeCommand::SaveWithId { id, content, respond_to }) => {
+                            info!("Saving to memory (client id {}): {}", id, content);
+                            match self.embedder.embed(&content).await {
+                                Ok(embedding) => {
+                                    let result = self
+                                        .vector_store
+                                        .add_document(&id, &content, embedding)
+                                        .await
+                                        .map_err(|e| e.to_string());
+                                    let _ = respond_to.send(result).await;
+                                }
+                                Err(e) => {
+                                    let _ = respond_to
+                                        .send(Err(format!("Error embedding: {}", e)))
+                                        .await;
+                                }
+                            }
+                        }
                         Some(NodeCommand::GetStatus { respond_to }) => {
                             let status = NodeStatus {
                                 peer_id: self.swarm.local_peer_id().to_string(),
@@ -822,6 +1058,30 @@ impl NodeService {
                                 }
                             }
                         }
+                        Some(NodeCommand::SearchFiltered { query, limit, source_type, date_from, date_to, respond_to }) => {
+                            info!("Processing Filtered Search Request: {} (type={:?})", query, source_type);
+                            match self.embedder.embed(&query).await {
+                                Ok(embedding) => {
+                                    match self
+                                        .vector_store
+                                        .search_filtered(embedding, limit, source_type, date_from, date_to)
+                                        .await
+                                    {
+                                        Ok(results) => {
+                                            let _ = respond_to.send(Ok(results)).await;
+                                        }
+                                        Err(e) => {
+                                            error!("Filtered search query failed: {}", e);
+                                            let _ = respond_to.send(Err(e.to_string())).await;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Embedding failed for filtered search: {}", e);
+                                    let _ = respond_to.send(Err(e.to_string())).await;
+                                }
+                            }
+                        }
                         Some(NodeCommand::ConnectPeer { address, respond_to }) => {
                             info!("ConnectPeer: Dialing {}", address);
                             match address.parse::<Multiaddr>() {
@@ -890,6 +1150,27 @@ impl NodeService {
                                 )).await;
                             }
                         }
+                        Some(NodeCommand::PublishSync { data }) => {
+                            // Best-effort live push. `InsufficientPeers` is the
+                            // expected, benign case when this device is alone on
+                            // the mesh — log at debug, not error, so it doesn't
+                            // spam the console for single-device users.
+                            match self.swarm.behaviour_mut().gossipsub.publish(self.sync_topic.clone(), data) {
+                                Ok(_) => tracing::debug!("Published sync record"),
+                                Err(gossipsub::PublishError::InsufficientPeers) => {
+                                    tracing::debug!("No sync peers connected; record will reconcile later");
+                                }
+                                Err(e) => warn!("Failed to publish sync record: {}", e),
+                            }
+                        }
+                        Some(NodeCommand::SetSyncSink { sender }) => {
+                            info!("Sync inbound sink installed");
+                            self.sync_inbound = Some(sender);
+                        }
+                        Some(NodeCommand::SetReconcileResponder { sender }) => {
+                            info!("Reconcile responder installed");
+                            self.sync_responder = Some(sender);
+                        }
                         None => {
                             // Channel closed
                             break;
@@ -905,5 +1186,64 @@ impl NodeService {
         if let Err(e) = self.mesh_state.update(heartbeat) {
             error!("Failed to update mesh state: {}", e);
         }
+    }
+
+    /// Kick off a Merkle reconciliation with a freshly-connected peer: ask the
+    /// app for our own sealed summary and, if we have one (i.e. we're paired),
+    /// advertise it on `/plexus/sync/1.0.0`. The peer answers with the sealed
+    /// records we're missing. Inert when no responder is installed or the
+    /// device is unpaired (empty summary → nothing to advertise).
+    async fn initiate_reconcile(&mut self, peer_id: PeerId) {
+        let responder = match &self.sync_responder {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        let (tx, rx) = oneshot::channel();
+        if responder
+            .send(ReconcileQuery::Summary { reply: tx })
+            .await
+            .is_err()
+        {
+            warn!("Reconcile responder dropped; cannot initiate sync");
+            return;
+        }
+        let sealed_summary = match rx.await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if sealed_summary.is_empty() {
+            // Unpaired (no key) — advertise nothing.
+            return;
+        }
+        self.swarm
+            .behaviour_mut()
+            .sync_rr
+            .send_request(&peer_id, SyncRequest::Summary { sealed_summary });
+        info!("Initiated Merkle reconciliation with {}", peer_id);
+
+        // Step 7: also advertise our attachment-blob have-set so the peer can
+        // push back any blob we're missing. Independent of the record round
+        // above — request_response multiplexes both in flight. Unpaired
+        // devices return an empty have-set and advertise nothing.
+        let (btx, brx) = oneshot::channel();
+        if responder
+            .send(ReconcileQuery::BlobHaveSet { reply: btx })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let sealed_haveset = match brx.await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if sealed_haveset.is_empty() {
+            return;
+        }
+        self.swarm
+            .behaviour_mut()
+            .sync_rr
+            .send_request(&peer_id, SyncRequest::BlobHaveSet { sealed_haveset });
+        info!("Advertised blob have-set to {}", peer_id);
     }
 }
