@@ -1,9 +1,12 @@
+use crate::swarm_behaviour::{
+    NegotiationRequest, NegotiationResponse, IDENTIFY_PROTOCOL, NEGOTIATION_PROTOCOL,
+};
 use crate::{GenerateRequest, GenerateResponse, SyncRequest, SyncResponse};
 use anyhow::{Context, Result};
 use libp2p::{
-    dcutr, gossipsub,
+    dcutr, gossipsub, identify,
     identity::Keypair,
-    kad, noise, relay,
+    kad, mdns, noise, relay,
     request_response::{self, cbor, ProtocolSupport},
     swarm::NetworkBehaviour,
     tcp, yamux, StreamProtocol, Swarm,
@@ -34,6 +37,22 @@ pub struct PlexusBehaviour {
     pub sync_rr: cbor::Behaviour<SyncRequest, SyncResponse>,
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
+    // Local-network peer discovery. Without this, two devices on the same Wi-Fi
+    // (e.g. an iPhone + iPad) have no way to find each other — Kademlia/relay
+    // need internet bootstrap — so the mesh shows 0 active nodes after pairing.
+    pub mdns: mdns::tokio::Behaviour,
+    /// Generic agent-negotiation protocol (Mindora 2.0). One-shot
+    /// request/response carrying an **opaque CBOR byte envelope**
+    /// ([`NegotiationRequest`]); the app serializes its strongly-typed
+    /// `NegotiationPayload` into those bytes (see
+    /// `rust_lib_mindora::core::negotiation`). Kept on its own protocol id
+    /// (`/mindora/negotiate/1.0.0`) so it never parses against `request_response`
+    /// (compute offload) or `sync_rr` (anti-entropy).
+    pub negotiation: cbor::Behaviour<NegotiationRequest, NegotiationResponse>,
+    /// Peer address/protocol discovery. Feeds learned listen addresses into
+    /// Kademlia as connectivity changes across Wi-Fi / cellular / relay, which
+    /// the negotiation + dcutr stack relies on to reach a peer directly.
+    pub identify: identify::Behaviour,
 }
 
 /// Build a production-ready swarm with full NAT traversal support.
@@ -125,6 +144,18 @@ pub async fn build_swarm_safe(keypair: Keypair) -> Result<Swarm<PlexusBehaviour>
         sync_rr_config,
     );
 
+    // ── Agent negotiation Request-Response (Mindora 2.0) ─────────────────
+    // Opaque CBOR byte envelopes; a single turn is a small encrypted blob plus
+    // a remote on-device LLM evaluation, so the timeout matches the engine's
+    // per-turn budget rather than the minutes-long generation path.
+    let negotiation = cbor::Behaviour::new(
+        [(
+            StreamProtocol::new(NEGOTIATION_PROTOCOL),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default().with_request_timeout(Duration::from_secs(30)),
+    );
+
     info!("build_swarm: Configuring transport stack...");
 
     // ── Transport: TCP + QUIC + Relay, all with Noise encryption ─────────
@@ -147,6 +178,21 @@ pub async fn build_swarm_safe(keypair: Keypair) -> Result<Swarm<PlexusBehaviour>
             // DCUtR: upgrades relay connections to direct via hole-punching
             let dcutr = dcutr::Behaviour::new(peer_id);
 
+            // mDNS: discover peers on the same LAN (the path two paired
+            // home devices actually use). Discovered addresses are fed to
+            // Kademlia and dialed in node_service's event loop.
+            let mdns =
+                mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
+
+            // Identify: advertise our public key + listen addresses so peers can
+            // dial us back directly. Constructed here because it needs the
+            // node's public key (the rest of the agent-negotiation stack — the
+            // request_response half — has no key dependency and is built above).
+            let identify = identify::Behaviour::new(identify::Config::new(
+                IDENTIFY_PROTOCOL.to_string(),
+                key.public(),
+            ));
+
             Ok(PlexusBehaviour {
                 gossipsub,
                 kademlia,
@@ -154,6 +200,9 @@ pub async fn build_swarm_safe(keypair: Keypair) -> Result<Swarm<PlexusBehaviour>
                 sync_rr,
                 relay_client,
                 dcutr,
+                mdns,
+                negotiation,
+                identify,
             })
         })
         .context("Failed to build Swarm behaviour")?

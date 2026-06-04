@@ -2,13 +2,15 @@ use crate::{
     build_swarm_safe,
     protocol::{Heartbeat, NodeCapabilities},
     swarm::PlexusBehaviourEvent,
-    GenerateRequest, GenerateResponse, IdentityStore, PlexusBehaviour, SyncRequest, SyncResponse,
+    GenerateRequest, GenerateResponse, IdentityStore, NegotiationRequest, NegotiationResponse,
+    PlexusBehaviour, SyncRequest, SyncResponse,
 };
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::{
     dcutr,
     gossipsub::{self, IdentTopic},
+    identify, mdns,
     multiaddr::Protocol,
     relay,
     request_response::{self, OutboundRequestId},
@@ -148,6 +150,62 @@ pub enum NodeCommand {
     SetReconcileResponder {
         sender: mpsc::Sender<ReconcileQuery>,
     },
+    /// Send one agent-negotiation turn to `peer_b58` and await its reply
+    /// (Mindora 2.0). `payload_cbor` is the opaque, app-serialized
+    /// `NegotiationPayload`; the swarm wraps it in a [`NegotiationRequest`],
+    /// routes it over `/mindora/negotiate/1.0.0`, and resolves `reply` with the
+    /// peer's response bytes (or a transport error string). The app's
+    /// `NegotiationTransport` impl owns the byte ↔ payload conversion — the
+    /// network layer never inspects the bytes.
+    SendNegotiation {
+        peer_b58: String,
+        payload_cbor: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    /// Install the channel the swarm uses to ask the app to answer an inbound
+    /// negotiation turn. Mirrors [`NodeCommand::SetReconcileResponder`]: a
+    /// runtime command (keeps `NodeService::new` stable) carrying each inbound
+    /// request as a [`NegotiationQuery`]. While no responder is installed,
+    /// inbound negotiation requests are answered with an empty envelope (the
+    /// initiator decodes that as a dropped turn and stops).
+    SetNegotiationResponder {
+        sender: mpsc::Sender<NegotiationQuery>,
+    },
+    /// Direct, single-shot local model generation on a fully-formed prompt —
+    /// no chat history, no RAG augmentation, no remote offload. Used by the
+    /// agent-negotiation evaluator so its prompts never pollute the user's
+    /// conversation or persist to disk. Resolves with the model's full text or
+    /// an error string.
+    GenerateRaw {
+        prompt: String,
+        respond_to: oneshot::Sender<Result<String, String>>,
+    },
+    /// Install a sink that receives a peer's base-58 `PeerId` each time a
+    /// connection to it is established. The app uses it to resume negotiations
+    /// that dropped with that peer (Mindora 2.0, Step B). Best-effort
+    /// (`try_send`); a full channel just skips a notification.
+    SetPeerReconnectSink {
+        sender: mpsc::Sender<String>,
+    },
+}
+
+/// What the swarm asks the app when a negotiation request arrives from a peer.
+///
+/// Mirrors [`ReconcileQuery`]: `plexus-p2p` can't depend on the app's
+/// negotiation engine (dependency cycle), so the app drains this channel,
+/// deserializes `payload_cbor` into its `NegotiationPayload`, runs
+/// `AgentReconciliationEngine::handle_inbound`, and replies with the response
+/// bytes. The engine — the local AI gatekeeper — therefore stays the exclusive
+/// arbiter of what the remote peer ever sees (SovereigntyShield).
+pub enum NegotiationQuery {
+    /// A peer sent us a negotiation turn. `peer_b58` is its base-58 `PeerId`;
+    /// `payload_cbor` the opaque inbound bytes. The app replies with the
+    /// response bytes (an empty `Vec` drops the turn).
+    Inbound {
+        peer_b58: String,
+        payload_cbor: Vec<u8>,
+        reply: oneshot::Sender<Vec<u8>>,
+    },
 }
 
 /// A reconciliation question the swarm asks the app to answer. Every byte
@@ -218,6 +276,19 @@ pub struct NodeService {
     /// app wires it up; while `None`, anti-entropy is inert (the device never
     /// initiates a summary exchange and answers inbound ones with nothing).
     sync_responder: Option<mpsc::Sender<ReconcileQuery>>,
+    /// Pending outbound negotiation turns (mapped from request_id to the
+    /// one-shot the app's `NegotiationTransport` is awaiting). Fulfilled when
+    /// the peer's response — or an outbound failure — arrives.
+    pending_negotiations: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<u8>, String>>>,
+    /// Channel the swarm uses to ask the app to answer an inbound negotiation
+    /// turn, installed via [`NodeCommand::SetNegotiationResponder`]. `None`
+    /// until the app wires up its reconciliation engine; while `None`, inbound
+    /// negotiation requests are answered with an empty envelope.
+    negotiation_responder: Option<mpsc::Sender<NegotiationQuery>>,
+    /// Sink notified with a peer's base-58 id on each connection establishment,
+    /// installed via [`NodeCommand::SetPeerReconnectSink`]. Drives negotiation
+    /// resume-after-reconnect; `None` until the app wires it up.
+    peer_reconnect_sink: Option<mpsc::Sender<String>>,
     active_model: String,
     /// Known paired peers for auto-reconnection
     paired_peers: Vec<(PeerId, Multiaddr)>,
@@ -459,6 +530,9 @@ impl NodeService {
             sync_topic,
             sync_inbound: None,
             sync_responder: None,
+            pending_negotiations: HashMap::new(),
+            negotiation_responder: None,
+            peer_reconnect_sink: None,
             active_model: model_id,
             paired_peers: Vec::new(),
             relay_addr: None,
@@ -621,8 +695,9 @@ impl NodeService {
                                 self.update_mesh_state(heartbeat);
                             }
                         }
-                        // mDNS removed for "Safe Mode" debugging
-                        /*
+                        // Local-network discovery: add each mDNS-found peer to
+                        // Kademlia and dial it, so two devices on the same Wi-Fi
+                        // connect without any internet bootstrap.
                         SwarmEvent::Behaviour(PlexusBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
                             for (peer, addr) in peers {
                                 info!("MDNS Discovered: {} at {}", peer, addr);
@@ -632,7 +707,6 @@ impl NodeService {
                                 }
                             }
                         }
-                        */
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             info!("Connection established with {}", peer_id);
                             // Reset backoff on successful connection
@@ -640,6 +714,11 @@ impl NodeService {
                             // Anti-entropy: catch up anything missed while one
                             // of us was offline. No-op unless paired.
                             self.initiate_reconcile(peer_id).await;
+                            // Notify the app so it can resume any negotiation
+                            // that dropped with this peer (Mindora 2.0, Step B).
+                            if let Some(tx) = &self.peer_reconnect_sink {
+                                let _ = tx.try_send(peer_id.to_base58());
+                            }
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             info!("Connection closed with {}", peer_id);
@@ -793,6 +872,72 @@ impl NodeService {
                                         }
                                     }
                                 },
+                            }
+                        }
+                        SwarmEvent::Behaviour(PlexusBehaviourEvent::Negotiation(
+                            request_response::Event::Message { peer, message }
+                        )) => {
+                            match message {
+                                // A peer sent us a negotiation turn. Hand the
+                                // opaque bytes to the app's engine (the local AI
+                                // gatekeeper) and ship its reply straight back.
+                                request_response::Message::Request { request, channel, .. } => {
+                                    let payload_cbor = match &self.negotiation_responder {
+                                        Some(responder) => {
+                                            let (tx, rx) = oneshot::channel();
+                                            if responder
+                                                .send(NegotiationQuery::Inbound {
+                                                    peer_b58: peer.to_base58(),
+                                                    payload_cbor: request.payload_cbor,
+                                                    reply: tx,
+                                                })
+                                                .await
+                                                .is_ok()
+                                            {
+                                                rx.await.unwrap_or_default()
+                                            } else {
+                                                Vec::new()
+                                            }
+                                        }
+                                        None => {
+                                            tracing::debug!(
+                                                "Negotiation request from {} dropped; no responder installed",
+                                                peer
+                                            );
+                                            Vec::new()
+                                        }
+                                    };
+                                    let _ = self
+                                        .swarm
+                                        .behaviour_mut()
+                                        .negotiation
+                                        .send_response(channel, NegotiationResponse { payload_cbor });
+                                }
+                                // The peer's reply to a turn we initiated.
+                                request_response::Message::Response { request_id, response } => {
+                                    if let Some(tx) = self.pending_negotiations.remove(&request_id) {
+                                        let _ = tx.send(Ok(response.payload_cbor));
+                                    }
+                                }
+                            }
+                        }
+                        SwarmEvent::Behaviour(PlexusBehaviourEvent::Negotiation(
+                            request_response::Event::OutboundFailure { request_id, error, .. }
+                        )) => {
+                            // Free the waiting transport instead of letting it
+                            // hang until its own timeout.
+                            if let Some(tx) = self.pending_negotiations.remove(&request_id) {
+                                let _ = tx.send(Err(format!("negotiation outbound failure: {error}")));
+                            }
+                        }
+                        SwarmEvent::Behaviour(PlexusBehaviourEvent::Identify(
+                            identify::Event::Received { peer_id, info, .. }
+                        )) => {
+                            // Feed the peer's advertised listen addresses into
+                            // Kademlia so dcutr / negotiation can reach it
+                            // directly as connectivity changes.
+                            for addr in info.listen_addrs {
+                                self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
                             }
                         }
                         SwarmEvent::Behaviour(_) => {}
@@ -1170,6 +1315,41 @@ impl NodeService {
                         Some(NodeCommand::SetReconcileResponder { sender }) => {
                             info!("Reconcile responder installed");
                             self.sync_responder = Some(sender);
+                        }
+                        Some(NodeCommand::SetNegotiationResponder { sender }) => {
+                            info!("Negotiation responder installed");
+                            self.negotiation_responder = Some(sender);
+                        }
+                        Some(NodeCommand::SetPeerReconnectSink { sender }) => {
+                            info!("Peer-reconnect sink installed");
+                            self.peer_reconnect_sink = Some(sender);
+                        }
+                        Some(NodeCommand::GenerateRaw { prompt, respond_to }) => {
+                            // Direct local generation — no history, no RAG, no
+                            // offload. Errors are returned to the caller rather
+                            // than surfaced as chat output.
+                            let result = self
+                                .ai_engine
+                                .generate(&prompt)
+                                .await
+                                .map_err(|e| e.to_string());
+                            let _ = respond_to.send(result);
+                        }
+                        Some(NodeCommand::SendNegotiation { peer_b58, payload_cbor, reply }) => {
+                            match peer_b58.parse::<PeerId>() {
+                                Ok(peer) => {
+                                    let request_id = self.swarm.behaviour_mut().negotiation.send_request(
+                                        &peer,
+                                        NegotiationRequest { payload_cbor },
+                                    );
+                                    // Resolved when the matching Response /
+                                    // OutboundFailure event arrives.
+                                    self.pending_negotiations.insert(request_id, reply);
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(format!("invalid peer id '{peer_b58}': {e}")));
+                                }
+                            }
                         }
                         None => {
                             // Channel closed
