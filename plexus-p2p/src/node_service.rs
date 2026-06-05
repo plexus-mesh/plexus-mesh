@@ -298,6 +298,13 @@ pub struct NodeService {
     last_connect_attempt: HashMap<PeerId, Instant>,
     /// Reconnection backoff counter per peer
     reconnect_backoff: HashMap<PeerId, u32>,
+    /// In-flight explicit dials (from `ConnectPeer`) awaiting their real
+    /// outcome. `swarm.dial()` only reports that a dial was *initiated*; the
+    /// actual success/failure arrives later as `ConnectionEstablished` /
+    /// `OutgoingConnectionError`. We park the reply here keyed by the dialed
+    /// peer and resolve it on that event, so the app sees the true result
+    /// (e.g. a timeout) instead of a misleading immediate "ok".
+    pending_dials: HashMap<PeerId, mpsc::Sender<Result<(), String>>>,
 }
 
 impl NodeService {
@@ -538,6 +545,7 @@ impl NodeService {
             relay_addr: None,
             last_connect_attempt: HashMap::new(),
             reconnect_backoff: HashMap::new(),
+            pending_dials: HashMap::new(),
         })
     }
 
@@ -719,9 +727,24 @@ impl NodeService {
                             if let Some(tx) = &self.peer_reconnect_sink {
                                 let _ = tx.try_send(peer_id.to_base58());
                             }
+                            // Resolve an explicit ConnectPeer dial that was waiting
+                            // on this connection's real outcome.
+                            if let Some(reply) = self.pending_dials.remove(&peer_id) {
+                                let _ = reply.send(Ok(())).await;
+                            }
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             info!("Connection closed with {}", peer_id);
+                        }
+                        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                            warn!("Outgoing connection error to {:?}: {}", peer_id, error);
+                            // Surface the real dial failure (timeout, refused,
+                            // handshake, …) back to a waiting ConnectPeer caller.
+                            if let Some(pid) = peer_id {
+                                if let Some(reply) = self.pending_dials.remove(&pid) {
+                                    let _ = reply.send(Err(format!("{}", error))).await;
+                                }
+                            }
                         }
                         // Relay events
                         SwarmEvent::Behaviour(PlexusBehaviourEvent::RelayClient(
@@ -1243,9 +1266,20 @@ impl NodeService {
                                     }
 
                                     match self.swarm.dial(addr) {
-                                        Ok(_) => {
-                                            let _ = respond_to.send(Ok(())).await;
-                                        }
+                                        Ok(_) => match peer_id {
+                                            // Resolve later, on the real connection
+                                            // outcome (ConnectionEstablished /
+                                            // OutgoingConnectionError).
+                                            Some(pid) => {
+                                                self.pending_dials.insert(pid, respond_to);
+                                            }
+                                            // No peer id in the address — can't
+                                            // correlate the outcome; report that the
+                                            // dial at least started.
+                                            None => {
+                                                let _ = respond_to.send(Ok(())).await;
+                                            }
+                                        },
                                         Err(e) => {
                                             let _ = respond_to.send(Err(format!("Dial failed: {}", e))).await;
                                         }
