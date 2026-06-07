@@ -42,10 +42,13 @@ pub const NEGOTIATION_PROTOCOL: &str = "/mindora/negotiate/1.0.0";
 /// `agentVersion`-style identify protocol string advertised to peers.
 pub const IDENTIFY_PROTOCOL: &str = "/mindora/id/1.0.0";
 
-/// Request timeout for a single negotiation turn. Generous enough to cover a
-/// local LLM evaluation on the remote device, short enough to free resources if
-/// a peer goes dark mid-turn.
-const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Request timeout for a single negotiation turn. Must comfortably cover a full
+/// on-device LLM evaluation on the *remote* peer — a small model (e.g. Gemma 2B)
+/// generating a verdict can take tens of seconds, more on a cold model load —
+/// while still freeing resources if a peer goes dark mid-turn. 30s proved too
+/// tight on real devices (the responder was still evaluating when the initiator
+/// timed out with "Timeout while waiting for a response").
+const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Opaque request envelope: the CBOR-serialized bytes of the app's
 /// `NegotiationPayload`. This crate never inspects them.
