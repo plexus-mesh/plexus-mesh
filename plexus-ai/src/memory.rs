@@ -156,6 +156,12 @@ impl BertEmbedder {
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         self.ensure_loaded().await?;
 
+        // Serialize this Metal compute against the app's Gemma decoder (see
+        // [`crate::COMPUTE_GUARD`]). Acquired *before* the sync `model` lock —
+        // and there is no `.await` from here to the end of the function — so the
+        // async guard is held cleanly across the (synchronous) candle compute.
+        let _compute = crate::COMPUTE_GUARD.lock().await;
+
         // We hold the lock during inference for simplicity since BertModel isn't Clone
         let mut guard = self.model.lock().unwrap();
         let model = guard.as_mut().unwrap();

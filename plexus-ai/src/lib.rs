@@ -8,6 +8,21 @@ pub use engine::TinyLlamaEngine;
 #[cfg(feature = "lancedb")]
 pub use lance_store::LanceDbStore;
 pub use memory::{BertEmbedder, QdrantStore, SimpleVectorStore};
+
+/// Process-wide serialization of on-device GPU/Metal work.
+///
+/// The BERT embedder (candle/Metal, [`BertEmbedder::embed`]) and the app's
+/// Gemma decoder (llama.cpp/Metal, in `rust_lib_mindora`) are two independent
+/// runtimes that each allocate Metal buffers. Running them at the same time
+/// exceeds the per-process Metal budget and hard-crashes the app (milder
+/// overlaps merely fail the embed/inference). Every on-device GPU operation —
+/// in *either* crate — must `COMPUTE_GUARD.lock().await` for the duration of its
+/// compute so the two can never touch the allocator concurrently.
+///
+/// Deadlock-free by construction: no GPU op nests another (embed never infers,
+/// inference never embeds), so a holder never re-acquires the guard.
+pub static COMPUTE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub use mock::MockEngine;
 pub use ollama::OllamaEngine;
 pub mod chat;
