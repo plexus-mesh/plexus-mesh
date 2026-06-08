@@ -631,7 +631,19 @@ impl NodeService {
     }
 
     pub async fn run(mut self) -> Result<()> {
-        // Listen on all interfaces — TCP and QUIC
+        // Stable TCP port: a restarted peer comes back at the SAME address, so
+        // the paired QR address and auto-reconnect survive an app restart
+        // (mDNS can't rediscover on iOS, so a fresh ephemeral port would strand
+        // the peer until a re-scan). We also keep an ephemeral TCP listener so a
+        // rare port conflict can never leave us with no TCP transport at all.
+        const MINDORA_TCP_PORT: u16 = 47474;
+        if let Err(e) = self
+            .swarm
+            .listen_on(format!("/ip4/0.0.0.0/tcp/{MINDORA_TCP_PORT}").parse()?)
+        {
+            warn!("Failed to bind stable TCP port {}: {}", MINDORA_TCP_PORT, e);
+        }
+        // Ephemeral fallback (TCP) + QUIC.
         if let Err(e) = self.swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?) {
             warn!("Failed to bind TCP listener: {}", e);
         }
@@ -1262,6 +1274,11 @@ impl NodeService {
                                     // Add to Kademlia for discovery
                                     if let Some(pid) = peer_id {
                                         self.swarm.behaviour_mut().kademlia.add_address(&pid, addr.clone());
+                                        // Replace any existing entry for this peer so a
+                                        // re-scan's fresh address supersedes a stale one
+                                        // (ports change across restarts) — otherwise the
+                                        // reconnect loop keeps dialing dead addresses.
+                                        self.paired_peers.retain(|(existing, _)| existing != &pid);
                                         self.paired_peers.push((pid, addr.clone()));
                                     }
 
