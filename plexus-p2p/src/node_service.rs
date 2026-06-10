@@ -8,6 +8,7 @@ use crate::{
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::{
+    core::ConnectedPoint,
     dcutr,
     gossipsub::{self, IdentTopic},
     identify, mdns,
@@ -630,18 +631,19 @@ impl NodeService {
         }
     }
 
+    /// Stable TCP listen port: a restarted peer comes back at the SAME address,
+    /// so the paired QR address and auto-reconnect survive an app restart
+    /// (mDNS can't rediscover on iOS, so a fresh ephemeral port would strand
+    /// the peer until a re-scan). An ephemeral TCP listener is kept as well so
+    /// a rare port conflict can never leave us with no TCP transport at all.
+    pub const MINDORA_TCP_PORT: u16 = 47474;
+
     pub async fn run(mut self) -> Result<()> {
-        // Stable TCP port: a restarted peer comes back at the SAME address, so
-        // the paired QR address and auto-reconnect survive an app restart
-        // (mDNS can't rediscover on iOS, so a fresh ephemeral port would strand
-        // the peer until a re-scan). We also keep an ephemeral TCP listener so a
-        // rare port conflict can never leave us with no TCP transport at all.
-        const MINDORA_TCP_PORT: u16 = 47474;
         if let Err(e) = self
             .swarm
-            .listen_on(format!("/ip4/0.0.0.0/tcp/{MINDORA_TCP_PORT}").parse()?)
+            .listen_on(format!("/ip4/0.0.0.0/tcp/{}", Self::MINDORA_TCP_PORT).parse()?)
         {
-            warn!("Failed to bind stable TCP port {}: {}", MINDORA_TCP_PORT, e);
+            warn!("Failed to bind stable TCP port {}: {}", Self::MINDORA_TCP_PORT, e);
         }
         // Ephemeral fallback (TCP) + QUIC.
         if let Err(e) = self.swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?) {
@@ -727,17 +729,60 @@ impl NodeService {
                                 }
                             }
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             info!("Connection established with {}", peer_id);
                             // Reset backoff on successful connection
                             self.reconnect_backoff.remove(&peer_id);
+                            // A restart-surviving dial address for this peer:
+                            //  * outbound: the address we just successfully
+                            //    dialed — provably reachable.
+                            //  * inbound: the remote's source port is an
+                            //    ephemeral outbound port (not dialable later),
+                            //    so rewrite to the stable listen port every
+                            //    node binds (MINDORA_TCP_PORT) at the observed
+                            //    IP — heals a peer's DHCP/IP change without a
+                            //    re-scan.
+                            let reachable: Option<Multiaddr> = match &endpoint {
+                                ConnectedPoint::Dialer { address, .. } => Some(address.clone()),
+                                ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr
+                                    .iter()
+                                    .find_map(|p| match p {
+                                        Protocol::Ip4(ip) => Some(ip),
+                                        _ => None,
+                                    })
+                                    .map(|ip| {
+                                        let mut a = Multiaddr::empty();
+                                        a.push(Protocol::Ip4(ip));
+                                        a.push(Protocol::Tcp(Self::MINDORA_TCP_PORT));
+                                        a.push(Protocol::P2p(peer_id));
+                                        a
+                                    }),
+                            };
+                            // Self-heal the reconnect target — but only for
+                            // peers already registered as paired; an arbitrary
+                            // inbound connection must never enrol itself into
+                            // the auto-reconnect loop.
+                            if let Some(addr) = &reachable {
+                                if let Some(entry) =
+                                    self.paired_peers.iter_mut().find(|(p, _)| p == &peer_id)
+                                {
+                                    entry.1 = addr.clone();
+                                }
+                            }
                             // Anti-entropy: catch up anything missed while one
                             // of us was offline. No-op unless paired.
                             self.initiate_reconcile(peer_id).await;
                             // Notify the app so it can resume any negotiation
                             // that dropped with this peer (Mindora 2.0, Step B).
+                            // Payload is "b58" or "b58|<reachable multiaddr>";
+                            // the address half lets the app persist a fresh
+                            // dial address (see Mindora's peer-address bus).
                             if let Some(tx) = &self.peer_reconnect_sink {
-                                let _ = tx.try_send(peer_id.to_base58());
+                                let payload = match &reachable {
+                                    Some(a) => format!("{}|{}", peer_id.to_base58(), a),
+                                    None => peer_id.to_base58(),
+                                };
+                                let _ = tx.try_send(payload);
                             }
                             // Resolve an explicit ConnectPeer dial that was waiting
                             // on this connection's real outcome.
