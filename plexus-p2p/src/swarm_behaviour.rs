@@ -83,7 +83,10 @@ impl AgentNetworkBehaviour {
     /// `local_public_key` over identify.
     pub fn new(peer_id: PeerId, local_public_key: PublicKey) -> Self {
         let negotiation = cbor::Behaviour::new(
-            [(StreamProtocol::new(NEGOTIATION_PROTOCOL), ProtocolSupport::Full)],
+            [(
+                StreamProtocol::new(NEGOTIATION_PROTOCOL),
+                ProtocolSupport::Full,
+            )],
             request_response::Config::default().with_request_timeout(NEGOTIATION_TIMEOUT),
         );
 

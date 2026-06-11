@@ -181,8 +181,7 @@ pub async fn build_swarm_safe(keypair: Keypair) -> Result<Swarm<PlexusBehaviour>
             // mDNS: discover peers on the same LAN (the path two paired
             // home devices actually use). Discovered addresses are fed to
             // Kademlia and dialed in node_service's event loop.
-            let mdns =
-                mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
+            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
 
             // Identify: advertise our public key + listen addresses so peers can
             // dial us back directly. Constructed here because it needs the

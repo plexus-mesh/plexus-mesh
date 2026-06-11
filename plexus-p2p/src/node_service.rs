@@ -650,7 +650,11 @@ impl NodeService {
             .swarm
             .listen_on(format!("/ip4/0.0.0.0/tcp/{}", Self::MINDORA_TCP_PORT).parse()?)
         {
-            warn!("Failed to bind stable TCP port {}: {}", Self::MINDORA_TCP_PORT, e);
+            warn!(
+                "Failed to bind stable TCP port {}: {}",
+                Self::MINDORA_TCP_PORT,
+                e
+            );
         }
         // Ephemeral fallback (TCP) + QUIC.
         if let Err(e) = self.swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?) {
