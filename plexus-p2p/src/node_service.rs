@@ -56,6 +56,13 @@ struct PairingResponse {
 #[derive(Debug)]
 pub enum NodeCommand {
     Shutdown,
+    /// Drop a peer from the auto-reconnect targets and close any live
+    /// connection — the unpair counterpart of `ConnectPeer`. Without it a
+    /// removed peer kept showing as connected and the reconnect loop kept
+    /// re-dialing it forever.
+    ForgetPeer {
+        peer_b58: String,
+    },
     Generate {
         prompt: String,
         respond_to: mpsc::Sender<String>,
@@ -1305,6 +1312,18 @@ impl NodeService {
                                     error!("Embedding failed for filtered search: {}", e);
                                     let _ = respond_to.send(Err(e.to_string())).await;
                                 }
+                            }
+                        }
+                        Some(NodeCommand::ForgetPeer { peer_b58 }) => {
+                            match peer_b58.parse::<PeerId>() {
+                                Ok(pid) => {
+                                    self.paired_peers.retain(|(existing, _)| existing != &pid);
+                                    self.reconnect_backoff.remove(&pid);
+                                    self.last_connect_attempt.remove(&pid);
+                                    let _ = self.swarm.disconnect_peer_id(pid);
+                                    info!("ForgetPeer: {} unregistered + disconnected", peer_b58);
+                                }
+                                Err(e) => warn!("ForgetPeer: invalid peer id {}: {}", peer_b58, e),
                             }
                         }
                         Some(NodeCommand::ConnectPeer { address, respond_to }) => {
