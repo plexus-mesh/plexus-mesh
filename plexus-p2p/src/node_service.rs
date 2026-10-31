@@ -834,32 +834,22 @@ impl NodeService {
                         )) => {
                             match message {
                                 request_response::Message::Request { request, channel, .. } => {
-                                    info!("Received remote generation request from {}: {}", peer, request.prompt);
-
-                                    // 0. RAG Retrieval
-                                    let mut context = String::new();
-                                    if let Ok(query_vec) = self.embedder.embed(&request.prompt).await {
-                                        if let Ok(results) = self.vector_store.search(query_vec, 3).await {
-                                            for (text, score) in results {
-                                                if score > 0.4 {
-                                                    info!("RAG Match found (score {:.2}): {}", score, text);
-                                                    context.push_str(&format!("Context information: {}\n", text));
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // 1. Format with Context & Time
-                                    let current_time = chrono::Utc::now().to_rfc3339();
-                                    let time_context = format!("Current System Time: {}\n", current_time);
-
-                                    let final_prompt = format!("{}{}{}", time_context, context, request.prompt);
-
-                                    let response = match self.ai_engine.generate(&final_prompt).await {
-                                        Ok(res) => res,
-                                        Err(e) => format!("Error: {}", e),
-                                    };
-                                    let _ = self.swarm.behaviour_mut().request_response.send_response(channel, GenerateResponse { response });
+                                    // Remote generation is refused. The handler used to
+                                    // run RAG over THIS device's vector store for any
+                                    // connected peer's prompt and send the answer back —
+                                    // no check that the peer is paired, so a stranger on
+                                    // the same network could read private memories out.
+                                    // It also ran inside this event loop and stalled the
+                                    // node for the whole generation. The prompt is never
+                                    // logged (it is the peer's data, or ours).
+                                    let _ = request;
+                                    info!("Refused a remote generation request from {}", peer);
+                                    let _ = self.swarm.behaviour_mut().request_response.send_response(
+                                        channel,
+                                        GenerateResponse {
+                                            response: "Error: remote generation is disabled".to_string(),
+                                        },
+                                    );
                                 }
                                 request_response::Message::Response { request_id, response } => {
                                     info!("Received remote response (len={})", response.response.len());
