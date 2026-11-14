@@ -688,6 +688,12 @@ impl NodeService {
                     self.try_reconnect_paired_peers().await;
                 }
                 _ = heartbeat_interval.tick() => {
+                    // Nobody to tell: a heartbeat carries CPU, RAM and the
+                    // model, which strangers on the network have no business
+                    // learning. Only devices we connected to on purpose get it.
+                    if self.paired_peers.is_empty() {
+                        continue;
+                    }
                     // Refresh stats
                     self.system.refresh_cpu_all();
                     self.system.refresh_memory();
@@ -735,6 +741,10 @@ impl NodeService {
                                     tracing::debug!("Received sync record but no sink installed yet; dropping");
                                 }
                             } else if let Ok(heartbeat) = serde_json::from_slice::<Heartbeat>(&message.data) {
+                                if !is_known_b58(&self.paired_peers, &heartbeat.peer_id) {
+                                    tracing::debug!("Ignored a heartbeat from an unknown peer");
+                                    continue;
+                                }
                                 info!("Received Heartbeat from {}: {} Cores, {} MB RAM",
                                     heartbeat.peer_id,
                                     heartbeat.capabilities.cpu_cores,
@@ -748,6 +758,13 @@ impl NodeService {
                         // connect without any internet bootstrap.
                         SwarmEvent::Behaviour(PlexusBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
                             for (peer, addr) in peers {
+                                // Only devices we know (paired, or dialed from
+                                // a pairing QR): every other Mindora on the
+                                // same Wi-Fi is a stranger and is not called.
+                                if !is_known(&self.paired_peers, &peer) {
+                                    tracing::debug!("MDNS: ignored unknown peer {}", peer);
+                                    continue;
+                                }
                                 info!("MDNS Discovered: {} at {}", peer, addr);
                                 self.swarm.behaviour_mut().kademlia.add_address(&peer, addr.clone());
                                 if let Err(e) = self.swarm.dial(addr) {
@@ -1558,5 +1575,38 @@ impl NodeService {
             .sync_rr
             .send_request(&peer_id, SyncRequest::BlobHaveSet { sealed_haveset });
         info!("Advertised blob have-set to {}", peer_id);
+    }
+}
+
+/// Whether [peer] is one this node connected to on purpose (a paired device,
+/// or one dialed from a pairing QR) — the only peers it calls back or
+/// tells about itself.
+fn is_known(paired: &[(PeerId, Multiaddr)], peer: &PeerId) -> bool {
+    paired.iter().any(|(p, _)| p == peer)
+}
+
+/// [`is_known`] for a base-58 id from a message; an unparsable id is unknown.
+fn is_known_b58(paired: &[(PeerId, Multiaddr)], peer_b58: &str) -> bool {
+    peer_b58
+        .parse::<PeerId>()
+        .map(|p| is_known(paired, &p))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod known_peer_tests {
+    use super::*;
+
+    #[test]
+    fn only_paired_peers_are_known() {
+        let paired = PeerId::random();
+        let stranger = PeerId::random();
+        let list = vec![(paired, "/ip4/192.168.1.2/tcp/47474".parse().unwrap())];
+        assert!(is_known(&list, &paired));
+        assert!(!is_known(&list, &stranger));
+        assert!(is_known_b58(&list, &paired.to_base58()));
+        assert!(!is_known_b58(&list, &stranger.to_base58()));
+        assert!(!is_known_b58(&list, "not a peer id"));
+        assert!(!is_known(&[], &paired));
     }
 }
