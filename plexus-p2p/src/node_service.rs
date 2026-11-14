@@ -666,9 +666,24 @@ impl NodeService {
 
         let mut heartbeat_interval = interval(Duration::from_secs(15));
         let mut reconnect_interval = interval(Duration::from_secs(30));
+        // Answers to inbound negotiation turns come back here from their own
+        // task: evaluating a turn runs the local LLM (seconds), and awaiting
+        // it inside this loop would freeze sync, dials and heartbeats.
+        let (negotiation_reply_tx, mut negotiation_reply_rx) = mpsc::unbounded_channel::<(
+            request_response::ResponseChannel<NegotiationResponse>,
+            Vec<u8>,
+        )>();
 
         loop {
             tokio::select! {
+                Some((channel, payload_cbor)) = negotiation_reply_rx.recv() => {
+                    // Fails only if the peer gave up waiting; nothing to do then.
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .negotiation
+                        .send_response(channel, NegotiationResponse { payload_cbor });
+                }
                 _ = reconnect_interval.tick() => {
                     self.try_reconnect_paired_peers().await;
                 }
@@ -963,36 +978,45 @@ impl NodeService {
                                 // opaque bytes to the app's engine (the local AI
                                 // gatekeeper) and ship its reply straight back.
                                 request_response::Message::Request { request, channel, .. } => {
-                                    let payload_cbor = match &self.negotiation_responder {
+                                    match self.negotiation_responder.clone() {
                                         Some(responder) => {
-                                            let (tx, rx) = oneshot::channel();
-                                            if responder
-                                                .send(NegotiationQuery::Inbound {
-                                                    peer_b58: peer.to_base58(),
-                                                    payload_cbor: request.payload_cbor,
-                                                    reply: tx,
-                                                })
-                                                .await
-                                                .is_ok()
-                                            {
-                                                rx.await.unwrap_or_default()
-                                            } else {
-                                                Vec::new()
-                                            }
+                                            // Answered from its own task; the reply
+                                            // re-enters the loop via `negotiation_reply_rx`.
+                                            let replies = negotiation_reply_tx.clone();
+                                            let peer_b58 = peer.to_base58();
+                                            tokio::spawn(async move {
+                                                let (tx, rx) = oneshot::channel();
+                                                let payload_cbor = if responder
+                                                    .send(NegotiationQuery::Inbound {
+                                                        peer_b58,
+                                                        payload_cbor: request.payload_cbor,
+                                                        reply: tx,
+                                                    })
+                                                    .await
+                                                    .is_ok()
+                                                {
+                                                    rx.await.unwrap_or_default()
+                                                } else {
+                                                    Vec::new()
+                                                };
+                                                let _ = replies.send((channel, payload_cbor));
+                                            });
                                         }
                                         None => {
                                             tracing::debug!(
                                                 "Negotiation request from {} dropped; no responder installed",
                                                 peer
                                             );
-                                            Vec::new()
+                                            let _ = self
+                                                .swarm
+                                                .behaviour_mut()
+                                                .negotiation
+                                                .send_response(
+                                                    channel,
+                                                    NegotiationResponse { payload_cbor: Vec::new() },
+                                                );
                                         }
-                                    };
-                                    let _ = self
-                                        .swarm
-                                        .behaviour_mut()
-                                        .negotiation
-                                        .send_response(channel, NegotiationResponse { payload_cbor });
+                                    }
                                 }
                                 // The peer's reply to a turn we initiated.
                                 request_response::Message::Response { request_id, response } => {
